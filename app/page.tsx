@@ -332,7 +332,7 @@ export default function SubtitlesEditor() {
     }
   };
 
-  // Client-Side Video Rendering & Export using HTML5 Canvas & MediaRecorder
+  // Client-Side Video Rendering & Export using HTML5 Canvas & MediaRecorder with robust Audio Multiplexing & Speed/Chunked Optimization
   const handleExportVideo = async () => {
     if (!videoSrc) {
       alert('Please upload a video first before exporting.');
@@ -345,7 +345,7 @@ export default function SubtitlesEditor() {
     try {
       const video = document.createElement('video');
       video.src = videoSrc;
-      video.muted = true;
+      video.muted = false; // Ensure audio is active for capture
       video.crossOrigin = 'anonymous';
 
       await new Promise((resolve, reject) => {
@@ -359,28 +359,50 @@ export default function SubtitlesEditor() {
       const canvas = document.createElement('canvas');
       canvas.width = videoWidth;
       canvas.height = videoHeight;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
       if (!ctx) {
         throw new Error('Could not create canvas context.');
       }
 
-      const stream = canvas.captureStream(30);
-      
+      // 1. ROBUST AUDIO MULTIPLEXING SETUP:
+      // Create an AudioContext and connect the HTML5 video element source to a MediaStreamDestination
+      // and also to audioCtx.destination (or keep muted/connected properly) so audio is fully preserved & multiplexed into MediaRecorder stream.
+      let audioCtx: AudioContext | null = null;
+      let audioStreamDestination: MediaStreamAudioDestinationNode | null = null;
+      let sourceNode: MediaElementAudioSourceNode | null = null;
+
       try {
-        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const source = audioCtx.createMediaElementSource(video);
-        const destination = audioCtx.createMediaStreamDestination();
-        source.connect(destination);
-        source.connect(audioCtx.destination);
-        if (destination.stream.getAudioTracks().length > 0) {
-          stream.addTrack(destination.stream.getAudioTracks()[0]);
+        audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
         }
-      } catch (e) {
-        console.log('Audio capture note:', e);
+        sourceNode = audioCtx.createMediaElementSource(video);
+        audioStreamDestination = audioCtx.createMediaStreamDestination();
+        
+        // Connect source to destination for MediaRecorder audio track
+        sourceNode.connect(audioStreamDestination);
+        // Also connect to audioCtx.destination so audio pipeline runs properly
+        sourceNode.connect(audioCtx.destination);
+      } catch (err) {
+        console.warn('AudioContext or Web Audio API setup warning:', err);
+      }
+
+      const canvasStream = canvas.captureStream(30);
+
+      // Multiplex the captured audio track into the canvas stream if available
+      if (audioStreamDestination && audioStreamDestination.stream.getAudioTracks().length > 0) {
+        const audioTrack = audioStreamDestination.stream.getAudioTracks()[0];
+        canvasStream.addTrack(audioTrack);
+        console.log('Successfully multiplexed original video audio track into export stream.');
+      } else {
+        console.warn('No audio track detected from video source or AudioContext destination.');
       }
 
       let mimeType = 'video/webm;codecs=vp9,opus';
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = 'video/webm;codecs=vp8,opus';
+      }
       if (!MediaRecorder.isTypeSupported(mimeType)) {
         mimeType = 'video/webm';
       }
@@ -388,8 +410,8 @@ export default function SubtitlesEditor() {
         mimeType = '';
       }
 
-      const mediaRecorderOptions = mimeType ? { mimeType } : {};
-      const mediaRecorder = new MediaRecorder(stream, mediaRecorderOptions);
+      const mediaRecorderOptions = mimeType ? { mimeType, videoBitsPerDwell: 5000000 } : {};
+      const mediaRecorder = new MediaRecorder(canvasStream, mediaRecorderOptions);
       const chunks: Blob[] = [];
 
       mediaRecorder.ondataavailable = (e) => {
@@ -399,40 +421,87 @@ export default function SubtitlesEditor() {
       };
 
       mediaRecorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'exported-subtitled-video.webm';
-        a.click();
-        URL.revokeObjectURL(url);
-        setIsExporting(false);
-        setExportProgress('');
+        // Use requestAnimationFrame / setTimeout to yield to main thread before blob generation and download triggering
+        setTimeout(() => {
+          const blob = new Blob(chunks, { type: 'video/webm' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'exported-subtitled-video.webm';
+          a.click();
+          
+          setTimeout(() => {
+            URL.revokeObjectURL(url);
+          }, 1000);
+
+          if (audioCtx && audioCtx.state !== 'closed') {
+            audioCtx.close().catch(() => {});
+          }
+
+          setIsExporting(false);
+          setExportProgress('');
+        }, 50);
       };
 
       video.currentTime = 0;
       await video.play();
-      mediaRecorder.start();
+      mediaRecorder.start(250); // Collect data chunks every 250ms for memory efficiency on long-form videos
 
-      const fps = 30;
-      const interval = 1000 / fps;
-      const totalDuration = video.duration;
+      const totalDuration = video.duration || 1;
+      
+      // Pre-sort and index subtitles for O(1) or binary search lookup
+      const sortedSubtitles = [...subtitles].sort((a, b) => a.start - b.start);
+
+      // Fast active subtitle finder
+      const findActiveSubtitle = (time: number) => {
+        for (let i = 0; i < sortedSubtitles.length; i++) {
+          const sub = sortedSubtitles[i];
+          if (time >= sub.start && time <= sub.end) {
+            return sub;
+          }
+          if (sub.start > time) {
+            break;
+          }
+        }
+        return null;
+      };
+
+      let isFinished = false;
+
+      const finishExport = () => {
+        if (isFinished) return;
+        isFinished = true;
+        try {
+          video.pause();
+        } catch (e) {}
+        if (mediaRecorder.state !== 'inactive') {
+          try {
+            mediaRecorder.requestData(); // Flush remaining buffers immediately
+            mediaRecorder.stop();
+          } catch (e) {}
+        }
+      };
 
       const renderFrame = () => {
+        if (isFinished) return;
+
         if (video.ended || video.currentTime >= totalDuration) {
-          video.pause();
-          mediaRecorder.stop();
+          finishExport();
           return;
         }
 
         const currentT = video.currentTime;
-        const progressPercent = Math.min(100, Math.round((currentT / totalDuration) * 100));
-        setExportProgress(`Rendering video... ${progressPercent}%`);
+        // Cap progress at 99% until onstop finalized blob download
+        const rawPercent = Math.round((currentT / totalDuration) * 100);
+        const progressPercent = Math.min(99, rawPercent);
+        
+        setExportProgress(`Finalizing video export... ${progressPercent}% (${formatTime(currentT)} / ${formatTime(totalDuration)})`);
 
-        ctx.clearRect(0, 0, videoWidth, videoHeight);
+        // Draw video frame to canvas
         ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
 
-        const activeSub = subtitles.find(sub => currentT >= sub.start && currentT <= sub.end);
+        // Render subtitle if active
+        const activeSub = findActiveSubtitle(currentT);
         if (activeSub) {
           ctx.save();
           const fontSize = Math.round(videoHeight * 0.06);
@@ -492,12 +561,26 @@ export default function SubtitlesEditor() {
           ctx.restore();
         }
 
-        setTimeout(() => {
+        if ('requestVideoFrameCallback' in video && typeof (video as any).requestVideoFrameCallback === 'function') {
+          (video as any).requestVideoFrameCallback(renderFrame);
+        } else {
           requestAnimationFrame(renderFrame);
-        }, interval);
+        }
       };
 
-      requestAnimationFrame(renderFrame);
+      // Fallback timeout watchdog in case video ended events miss
+      const watchdogTimer = setInterval(() => {
+        if (video.ended || (video.duration && video.currentTime >= video.duration - 0.1)) {
+          clearInterval(watchdogTimer);
+          finishExport();
+        }
+      }, 500);
+
+      if ('requestVideoFrameCallback' in video && typeof (video as any).requestVideoFrameCallback === 'function') {
+        (video as any).requestVideoFrameCallback(renderFrame);
+      } else {
+        requestAnimationFrame(renderFrame);
+      }
 
     } catch (err) {
       console.error(err);
