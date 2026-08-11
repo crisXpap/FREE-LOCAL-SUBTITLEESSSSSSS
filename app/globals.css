@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes subtitlePop {
+  0% {
+    transform: scale(0.7);
+    opacity: 0;
+  }
+  70% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-subtitle-pop {
+  animation: subtitlePop 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+@layer utilities {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: #150e08;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #412D15;
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #5a3e20;
+  }
+
+  .font-bangers {
+    font-family: 'Bangers', cursive, sans-serif;
+  }
+  .font-inter {
+    font-family: 'Inter', sans-serif !important;
+  }
+  .font-dm-sans {
+    font-family: 'DM Sans', sans-serif;
+  }
+}
